@@ -1,5 +1,6 @@
 import json
 import logging
+import sys
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime
@@ -13,11 +14,13 @@ from typeguard import typechecked
 
 from eyeballvul.config.config_loader import Config
 from eyeballvul.exceptions import (
+    AllOsvItemsWithdrawnError,
     ConflictingCommitError,
     GitRuntimeError,
     LinguistError,
-    NoOsvItemsLeftError,
+    NoAffectedVersionsError,
     RepoNotFoundError,
+    UnsupportedDomainError,
 )
 from eyeballvul.models.cache import Cache, CacheItem
 from eyeballvul.models.eyeballvul import EyeballvulItem, EyeballvulRevision
@@ -38,11 +41,16 @@ class ConversionStatusCode(Enum):
     """Possible outcomes of the conversion process."""
 
     OK = "OK"
+    UNSUPPORTED_DOMAIN = f"unsupported domain. Supported domains: {Config.supported_domains}"
+    NO_VERSION_FOUND_BY_GIT = "no provided affected version could be mapped to a git commit"
     REPO_NOT_FOUND = '"remote: Repository not found". Repo isn\'t accessible anymore'
     GIT_RUNTIME_ERROR = "runtime error while cloning the repo"
     LINGUIST_ERROR = "error running linguist"
     CONFLICTING_COMMIT = "the same commit already exists in another repo URL"
-    NO_OSV_ITEMS_LEFT = "all OSV items for this repo have been filtered out"
+    ALL_OSV_ITEMS_WITHDRAWN = "all OSV items for this repo have been withdrawn"
+    NO_AFFECTED_VERSIONS = (
+        "at least one non-withdrawn OSV item doesn't use the 'affected versions' syntax"
+    )
 
 
 @typechecked
@@ -77,14 +85,30 @@ class Converter:
         """
         try:
             with temp_directory() as repo_workdir:
-                return (
-                    *Converter.osv_group_to_eyeballvul_group(
+                eyeballvul_items, eyeballvul_revisions, cache = (
+                    Converter.osv_group_to_eyeballvul_group(
                         repo_url, repo_workdir, osv_items, cache, existing_revisions
-                    ),
-                    ConversionStatusCode.OK,
+                    )
                 )
-        except NoOsvItemsLeftError:
-            return [], [], cache, ConversionStatusCode.NO_OSV_ITEMS_LEFT
+                if not eyeballvul_items:
+                    status_code = ConversionStatusCode.NO_VERSION_FOUND_BY_GIT
+                    if eyeballvul_revisions:
+                        raise RuntimeError(
+                            "there should be no revisions if there are no items. There's a bug in the code."
+                        )
+                else:
+                    status_code = ConversionStatusCode.OK
+                return eyeballvul_items, eyeballvul_revisions, cache, status_code
+        except UnsupportedDomainError:
+            logging.warning(f"Domain {get_domain(repo_url)} not supported. Skipping.")
+            return [], [], cache, ConversionStatusCode.UNSUPPORTED_DOMAIN
+        except AllOsvItemsWithdrawnError:
+            return [], [], cache, ConversionStatusCode.ALL_OSV_ITEMS_WITHDRAWN
+        except NoAffectedVersionsError:
+            logging.warning(
+                f"At least one vuln in doesn't have affected versions in {repo_url}. Skipping."
+            )
+            return [], [], cache, ConversionStatusCode.NO_AFFECTED_VERSIONS
         except RepoNotFoundError:
             logging.warning(f"Repo {repo_url} not found. Skipping.")
             cache.doesnt_exist = True
@@ -214,6 +238,7 @@ class Converter:
                     future.cancel()
                 raise e
         self.print_statistics(repos_by_status_code, repo_len)
+        self.exit_with_status(repos_by_status_code)
 
     def convert_one(self, repo_url: str) -> None:
         """
@@ -238,12 +263,21 @@ class Converter:
         repos_by_status_code: dict[ConversionStatusCode, list[str]], repo_len: int
     ) -> None:
         """Display the statistics of the conversion process."""
-        only_print_length = [ConversionStatusCode.OK, ConversionStatusCode.NO_OSV_ITEMS_LEFT]
+        only_print_length = [ConversionStatusCode.OK, ConversionStatusCode.ALL_OSV_ITEMS_WITHDRAWN]
         logging.info("Done processing repositories. Statistics:")
         for status_code, concerned_repos in repos_by_status_code.items():
             logging.info(f"{len(concerned_repos)}/{repo_len}: {status_code}: {status_code.value}.")
             if status_code not in only_print_length:
                 logging.info(f"Concerned repos: {concerned_repos}")
+
+    @staticmethod
+    def exit_with_status(repos_by_status_code: dict[ConversionStatusCode, list[str]]) -> None:
+        """Exit with status 1 if there is any GIT_RUNTIME_ERROR, 0 otherwise."""
+        if ConversionStatusCode.GIT_RUNTIME_ERROR in repos_by_status_code:
+            logging.error(
+                "Returning an exit status 1 because of the presence of GIT_RUNTIME_ERROR."
+            )
+            sys.exit(1)
 
     def postprocess(self) -> None:
         """Functions applied after the bulk of the conversion."""
@@ -251,7 +285,9 @@ class Converter:
         self.remove_empty_revisions()
 
     def remove_stale_revisions(self) -> None:
-        """Remove all EyeballvulRevisions that don't have a corresponding EyeballvulItem."""
+        """Remove all EyeballvulRevisions that don't have a corresponding EyeballvulItem (for
+        instance because their associated EyeballvulItems have been withdrawn since the previous
+        update)."""
         with Session(self.engine) as session:
             revisions: dict[str, EyeballvulRevision] = {
                 revision.commit: revision
@@ -309,22 +345,11 @@ class Converter:
 
     @staticmethod
     def osv_items_by_repo(items: list[dict]) -> dict[str, list[dict]]:
-        """
-        Group the items from the osv.dev dataset by repository.
-
-        Filtering out unsupported domains is done in this function.
-        """
+        """Group the items from the osv.dev dataset by repository."""
         items_by_repo: dict[str, list] = {}
-        filtered_out = set()
         for item in items:
             repo_url = OSVVulnerability(**item).get_repo_url()
-            if get_domain(repo_url) not in Config.supported_domains:
-                filtered_out.add(repo_url)
-                continue
             items_by_repo.setdefault(repo_url, []).append(item)
-        logging.info(
-            f"Kept {len(items_by_repo)} repos. {len(filtered_out)} unsupported repos filtered out."
-        )
         return items_by_repo
 
     @staticmethod
@@ -344,6 +369,8 @@ class Converter:
 
         Versions that aren't found in the git repo are also ignored.
         """
+        if get_domain(repo_url) not in Config.supported_domains:
+            raise UnsupportedDomainError()
         # if the repo is known not to exist, raise that it doesn't exist immediately
         if cache.doesnt_exist:
             logging.info(f"Repo {repo_url} known not to exist. Skipping.")
@@ -354,11 +381,14 @@ class Converter:
                 f"Repo {repo_url} known to have a conflicting commit (also found in {conflict}). Skipping."
             )
             raise ConflictingCommitError()
-        osv_group = Converter.filter_out_no_affected_versions(osv_group)
         osv_group = Converter.filter_out_withdrawn(osv_group)
         if not osv_group:
-            logging.info(f"No OSV items with affected versions found for {repo_url}. Skipping.")
-            raise NoOsvItemsLeftError()
+            logging.info(f"All items are withdrawn for {repo_url}. Skipping.")
+            raise AllOsvItemsWithdrawnError()
+        for osv_item in osv_group:
+            if not osv_item.get_affected_versions():
+                logging.warning(f"OSV item {osv_item.id} doesn't have affected versions. Skipping.")
+                raise NoAffectedVersionsError()
         # For each affected version in each OSV item, find the corresponding commit and its date.
         # This will allow to sort versions chronologically, to use as a constraint
         # in the hitting set solver.
@@ -430,18 +460,6 @@ class Converter:
             )
             eyeballvul_items.append(eyeballvul_item)
         return eyeballvul_items, list(eyeballvul_revisions.values()), cache
-
-    @staticmethod
-    def filter_out_no_affected_versions(
-        osv_group: list[OSVVulnerability],
-    ) -> list[OSVVulnerability]:
-        """Filter out OSV items that don't have any affected version."""
-        filtered = [osv_item for osv_item in osv_group if osv_item.get_affected_versions()]
-        if len(filtered) < len(osv_group):
-            logging.debug(
-                f"Filtered out {len(osv_group) - len(filtered)}/{len(osv_group)} OSV items without affected versions."
-            )
-        return filtered
 
     @staticmethod
     def filter_out_withdrawn(osv_group: list[OSVVulnerability]) -> list[OSVVulnerability]:

@@ -13,7 +13,10 @@ The typical use case that this benchmark enables is the following:
 1. run a SAST tool (typically LLM-based) on the source code at each of these revisions;
 1. compare the results of the SAST tool with the list of known vulnerabilities for each revision, especially the ones that were published after the training data cutoff.
 
-eyeballvul currently contains 24,672 vulnerabilities, in 6,533 revisions and 5,983 repositories.
+eyeballvul currently contains 19,168 vulnerabilities, in 6,022 revisions and 5,715 repositories (last updated 2024-08-30).
+
+**Notable updates since publication:**
+- 2024-08-25: all repositories for which at least one item doesn't have an "affected versions" field are now dropped. Previously, only the OSV items were dropped instead of the entire repository, so some repositories had at least one known vulnerability excluded. As a consequence, some true positives could potentially be marked as false positives. This concerned 326 repositories out of 6,025 in the benchmark, or 5.4\% of repositories, among which 36\% of vulnerabilities were filtered out on average. The first version of [eyeballvul_data](https://github.com/timothee-chauvin/eyeballvul_data) to incorporate these changes is `2024-08-30`.
 
 ## Table of contents
 * [Installation](#installation)
@@ -444,7 +447,7 @@ Let's see how we would compute e.g. an F1 score from these results:
 
 ## FAQ
 ### I'm GPU poor
-The sum of the repository sizes at each revision is around 75GB. Let's assume this translates to roughly 20B tokens. At $15/Mtok, you would be spending over $300k for a single pass on the benchmark if for example you used Claude 3 Opus. The solution: select a small random subset of the benchmark. A way to construct subsets that has nice properties is to use **commit hashes in alphabetical order**. If you work on a subset of the benchmark, please do that. For instance:
+As of 2024-08-30, the sum of the repository sizes at each revision is around 37GB. Let's assume this translates to roughly 10B tokens. At $15/Mtok, you would be spending over $150k for a single pass on the benchmark if for example you used Claude 3 Opus. The solution: select a small random subset of the benchmark. A way to construct subsets that has nice properties is to use **commit hashes in alphabetical order**. If you work on a subset of the benchmark, please do that. For instance:
 ```python
 >>> commits = get_commits()
 >>> commit_subset = sorted(commits)[:100]
@@ -455,7 +458,7 @@ To get a rough idea of the total size of different subsets, you could do:
 >>> total_size = sum(get_revision(commit).size for commit in commit_subset)
 ```
 
-You may then further filter on reasonable criteria, such as repository size, language, or dates of vulnerabilities.
+The [eyeballvul paper](https://arxiv.org/abs/2407.08708) filtered out all revisions above 600kB, then used the 328 revisions having at least one vulnerability past the earliest knowledge cutoff of the models considered (2023-09-01), and the 700 first other revisions (sorted by commit hash).
 
 ### Where is the data?
 The data is kept in the [eyeballvul_data](https://github.com/timothee-chauvin/eyeballvul_data) repository. It is downloaded into `~/.cache/eyeballvul` when you run:
@@ -464,3 +467,6 @@ from eyeballvul import download_data
 download_data()
 ```
 The data sources (version-controlled OSV data, and eyeballvul cache) are kept in the [eyeballvul_data_sources](https://github.com/timothee-chauvin/eyeballvul_data_sources) repository.
+
+### How do I update the data myself?
+See the [README in the terraform directory](terraform/README.md).
